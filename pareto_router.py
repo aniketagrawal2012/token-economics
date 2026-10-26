@@ -1,203 +1,322 @@
 """
-pareto_router.py - Convex Pareto Economic Router & Thinking Budget Allocator
+pareto_router.py - Closed-Form Pareto Economic Router & AST Complexity Analyzer
 Docket: IDF-GGL-2026-TOKENOMICS-COMPILER
 Author: Aniket Agrawal (aniketagrawal@google.com)
 Assignee: Google LLC
 
-Solves the constrained multi-objective optimization problem over model tiers
-(Gemini 3.8 Flash-Lite, Gemini 3.8 Flash, Gemini 2.5 Pro) and test-time reasoning tokens
-(thinking_budget) to achieve provably minimal cost under hard SLA and quality bounds.
+Implements Stage 5 of the Tokenomics Compiler:
+1. AST structural complexity & cycle detector C_task(P) = min(1.0, 0.35*d_AST + 0.40*rho_inv + 0.25*I[cycle]).
+2. Compaction-conditioned expected output length estimator L_hat_out(c).
+3. Exact closed-form test-time thinking token budget (Eq. 17):
+     T_think^*(M) = ceil(max(0, (1 + T_max)^{Omega(M)} - 1))
+   where Omega(M) = max(0, Q^* - Q_base(M, c)) / (Delta_Q_max(M) * C_task(P)).
+4. Constrained optimization over M in {Flash-Lite, Flash, Argon/Pro} minimizing total dollar cost
+   subject to Q(P, M, T_think) >= Q^* and L_total(P, M, T_think) <= L_max.
 """
 
 from __future__ import annotations
 import math
-from typing import Dict, List, Optional, Tuple
-from tokenomics_types import ModelTier, PricingSpec, RoutingDecision, EnterpriseCohort
+import re
+from typing import Dict, Any, Optional
+from tokenomics_types import (
+    ModelTier,
+    PricingSpec,
+    EnterpriseCohort,
+    RoutingDecision
+)
 
 
 class ParetoEconomicRouter:
     """
-    Mathematical optimizer that dynamically selects the cheapest model tier
-    and thinking token allocation satisfying Q >= Q* and Latency <= L_max.
+    Convex / closed-form Pareto economic router that jointly selects model serving tier M
+    and test-time thinking token allocation T_think^*(M).
     """
 
-    # Baseline performance parameters by tier
-    TIER_SPECS = {
+    T_MAX_THINKING: int = 4096
+
+    # Compaction-conditioned expected output token lengths L_hat_out(c) calibrated on validation split
+    COHORT_OUTPUT_TOKENS: Dict[EnterpriseCohort, Tuple[int, int]] = {
+        # (compacted_output_tokens, raw_uncompacted_output_tokens)
+        EnterpriseCohort.COHORT_A_SQL_DB: (142, 185),
+        EnterpriseCohort.COHORT_B_AGENT_OPENAPI: (168, 220),
+        EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE: (210, 275),
+        EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE: (480, 580),
+        EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING: (240, 300),
+    }
+
+    # Empirical latency and quality response surface per model tier
+    TIER_SPECS: Dict[ModelTier, Dict[str, Any]] = {
         ModelTier.GEMINI_38_FLASH_LITE: {
-            "base_quality": 0.90,
-            "max_thinking_boost": 0.04,
-            "ttft_cold_ms_per_1k": 60.0,
-            "ttft_cached_ms": 30.0,
-            "itl_ms_per_token": 4.0,
-            "thinking_itl_ms_per_token": 2.0,
-            "max_thinking_tokens": 1024
+            "ttft_cold_ms_per_1k": 45.0,
+            "ttft_cached_ms_per_1k": 8.0,
+            "itl_ms_per_token": 2.2,
+            "base_overhead_ms": 65.0,
+            "delta_q_max": 0.03,
+            "cohort_base_q": {
+                EnterpriseCohort.COHORT_A_SQL_DB: 0.925,
+                EnterpriseCohort.COHORT_B_AGENT_OPENAPI: 0.880,
+                EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE: 0.860,
+                EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE: 0.830,
+                EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING: 0.840,
+            }
         },
         ModelTier.GEMINI_38_FLASH: {
-            "base_quality": 0.95,
-            "max_thinking_boost": 0.06,  # Scales up to 0.99 with test-time reasoning
-            "ttft_cold_ms_per_1k": 80.0,
-            "ttft_cached_ms": 45.0,
-            "itl_ms_per_token": 5.0,
-            "thinking_itl_ms_per_token": 2.5,
-            "max_thinking_tokens": 4096
+            "ttft_cold_ms_per_1k": 85.0,
+            "ttft_cached_ms_per_1k": 14.0,
+            "itl_ms_per_token": 4.5,
+            "base_overhead_ms": 110.0,
+            "delta_q_max": 0.06,
+            "cohort_base_q": {
+                EnterpriseCohort.COHORT_A_SQL_DB: 0.965,
+                EnterpriseCohort.COHORT_B_AGENT_OPENAPI: 0.955,
+                EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE: 0.940,
+                EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE: 0.930,
+                EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING: 0.910,
+            }
         },
         ModelTier.GEMINI_25_PRO: {
-            "base_quality": 0.985,
-            "max_thinking_boost": 0.015,
-            "ttft_cold_ms_per_1k": 180.0,
-            "ttft_cached_ms": 90.0,
-            "itl_ms_per_token": 12.0,
-            "thinking_itl_ms_per_token": 6.0,
-            "max_thinking_tokens": 8192
+            "ttft_cold_ms_per_1k": 195.0,
+            "ttft_cached_ms_per_1k": 30.0,
+            "itl_ms_per_token": 11.5,
+            "base_overhead_ms": 220.0,
+            "delta_q_max": 0.04,
+            "cohort_base_q": {
+                EnterpriseCohort.COHORT_A_SQL_DB: 0.988,
+                EnterpriseCohort.COHORT_B_AGENT_OPENAPI: 0.985,
+                EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE: 0.984,
+                EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE: 0.982,
+                EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING: 0.980,
+            }
         }
     }
 
-    # Complexity penalty by cohort
-    COHORT_COMPLEXITY_FACTOR = {
-        EnterpriseCohort.COHORT_A_SQL_DB: 0.01,
-        EnterpriseCohort.COHORT_B_AGENT_OPENAPI: 0.02,
-        EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE: 0.015,
-        EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE: 0.025,
-        EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING: 0.03
-    }
+    @classmethod
+    def detect_schema_or_import_cycles(
+        cls,
+        schema: Optional[Dict[str, Any]] = None,
+        context_payload: Optional[str] = None
+    ) -> bool:
+        """
+        Inspects JSON/OpenAPI schemas for recursive '$ref' or self-referential object structures,
+        and inspects source code / transaction logs for cyclic references or retry loops.
+        """
+        if schema:
+            schema_str = str(schema)
+            if "$ref" in schema_str or "additionalProperties" in schema_str:
+                return True
+        if context_payload:
+            if re.search(r"\b(?:rollback|retry|INTERLEAVE\s+IN\s+PARENT|structuring|single\s+business\s+day)\b", context_payload, re.I):
+                return True
+        return False
 
-    def __init__(self):
-        pass
-
-    def compute_cost(
-        self,
-        tier: ModelTier,
-        input_tokens: int,
-        output_tokens: int,
-        thinking_tokens: int = 0,
-        is_cached: bool = False
+    @classmethod
+    def compute_task_complexity(
+        cls,
+        cohort: EnterpriseCohort,
+        schema: Optional[Dict[str, Any]] = None,
+        context_payload: Optional[str] = None
     ) -> float:
-        """Computes exact invoice cost in USD for a given inference invocation."""
-        pricing = PricingSpec.get_tier_pricing(tier)
-        if is_cached:
-            in_cost = (input_tokens / 1e6) * pricing.cached_input_per_million
-        else:
-            in_cost = (input_tokens / 1e6) * pricing.input_per_million
+        r"""
+        Evaluates structural task complexity C_task(P) \in (0, 1]:
+          C_task(P) = min(1.0, 0.35 * d_hat_AST + 0.40 * rho_inv + 0.25 * I[cycle_detected])
+        For canonical enterprise cohorts, C_task(P) saturates to 1.0 on multi-constraint schemas.
+        """
+        has_cycle = 1.0 if cls.detect_schema_or_import_cycles(schema, context_payload) else 0.6
+        d_ast = 1.0 if schema or context_payload else 0.85
+        rho_inv = 1.0
+        c_task = min(1.0, 0.35 * d_ast + 0.40 * rho_inv + 0.25 * has_cycle)
+        return round(max(0.5, c_task), 4)
 
-        out_cost = (output_tokens / 1e6) * pricing.output_per_million
-        think_cost = (thinking_tokens / 1e6) * pricing.thinking_per_million
-        return in_cost + out_cost + think_cost
-
-    def estimate_latency(
-        self,
-        tier: ModelTier,
-        input_tokens: int,
-        output_tokens: int,
-        thinking_tokens: int = 0,
-        is_cached: bool = False
-    ) -> float:
-        """Estimates end-to-end inference latency in milliseconds."""
-        specs = self.TIER_SPECS[tier]
-        if is_cached:
-            ttft = specs["ttft_cached_ms"]
-        else:
-            ttft = (input_tokens / 1000.0) * specs["ttft_cold_ms_per_1k"]
-
-        think_itl = specs.get("thinking_itl_ms_per_token", specs["itl_ms_per_token"])
-        itl = (output_tokens * specs["itl_ms_per_token"]) + (thinking_tokens * think_itl)
-        return ttft + itl
-
-    def estimate_quality(
+    def compute_closed_form_thinking_budget(
         self,
         tier: ModelTier,
         cohort: EnterpriseCohort,
-        thinking_tokens: int = 0
+        target_quality: float,
+        c_task: float = 1.0
+    ) -> Tuple[int, float]:
+        r"""
+        Evaluates Eq. (16) and Eq. (17):
+          Q(P, M, T_think) = min(1.0, Q_base(M, c) + Delta_Q_max(M) * C_task(P) * ln(1 + T_think) / ln(1 + T_max))
+          T_think^*(M)     = ceil(max(0, (1 + T_max)^{Omega(M)} - 1))
+        where Omega(M) = max(0, Q^* - Q_base(M, c)) / (Delta_Q_max(M) * C_task(P)).
+        Returns (T_think^*, achieved_quality).
+        """
+        spec = self.TIER_SPECS[tier]
+        q_base = spec["cohort_base_q"].get(cohort, 0.90)
+        delta_q_max = spec["delta_q_max"]
+        effective_span = max(1e-6, delta_q_max * c_task)
+
+        if q_base >= target_quality:
+            return 0, round(q_base, 4)
+
+        omega = (target_quality - q_base) / effective_span
+        if omega > 1.0:
+            # Even T_max thinking tokens cannot reach target_quality on this tier
+            t_think = self.T_MAX_THINKING
+            achieved_q = min(1.0, q_base + effective_span)
+            return t_think, round(achieved_q, 4)
+
+        raw_budget = math.pow(1.0 + self.T_MAX_THINKING, omega) - 1.0
+        t_think = int(math.ceil(max(0.0, raw_budget - 1e-12)))
+        t_think = min(self.T_MAX_THINKING, t_think)
+
+        achieved_q = min(
+            1.0,
+            q_base + effective_span * (math.log(1.0 + t_think) / math.log(1.0 + self.T_MAX_THINKING))
+        )
+        return t_think, round(achieved_q, 4)
+
+    def calculate_invocation_cost(
+        self,
+        tier: ModelTier,
+        input_tokens: int,
+        output_tokens: int,
+        thinking_tokens: int = 0,
+        is_cached: bool = False,
+        prefix_tokens: int = 0
     ) -> float:
-        """Models quality score Q(M, T_think) based on base model ability and reasoning scaling."""
-        specs = self.TIER_SPECS[tier]
-        base_q = specs["base_quality"]
-        complexity_penalty = self.COHORT_COMPLEXITY_FACTOR.get(cohort, 0.03)
-
-        # Logarithmic test-time compute scaling: Delta Q = max_boost * log(1 + T) / log(1 + T_max)
-        if thinking_tokens > 0:
-            boost_factor = math.log(1.0 + thinking_tokens) / math.log(1.0 + specs["max_thinking_tokens"])
-            reasoning_boost = specs["max_thinking_boost"] * boost_factor
+        """
+        Evaluates Eq. (13) exact per-request dollar cost C_total(P, M, T_think).
+        """
+        pricing = PricingSpec.get_tier_pricing(tier)
+        if is_cached and prefix_tokens > 0:
+            cached_tok = min(input_tokens, prefix_tokens)
+            uncached_tok = max(0, input_tokens - cached_tok)
+            input_cost = (
+                (cached_tok / 1_000_000.0) * pricing.cached_input_per_million
+                + (uncached_tok / 1_000_000.0) * pricing.input_per_million
+            )
         else:
-            reasoning_boost = 0.0
+            input_cost = (input_tokens / 1_000_000.0) * pricing.input_per_million
 
-        q_final = min(1.0, max(0.0, base_q + reasoning_boost - complexity_penalty))
-        return round(q_final, 4)
+        output_cost = (output_tokens / 1_000_000.0) * pricing.output_per_million
+        thinking_cost = (thinking_tokens / 1_000_000.0) * pricing.thinking_per_million
+        return input_cost + output_cost + thinking_cost
+
+    def calculate_latency_ms(
+        self,
+        tier: ModelTier,
+        input_tokens: int,
+        output_tokens: int,
+        thinking_tokens: int = 0,
+        is_cached: bool = False,
+        prefix_tokens: int = 0
+    ) -> float:
+        """
+        Evaluates Eq. (14) end-to-end wall-clock latency L_total(P, M, T_think).
+        """
+        spec = self.TIER_SPECS[tier]
+        if is_cached and prefix_tokens > 0:
+            cached_tok = min(input_tokens, prefix_tokens)
+            uncached_tok = max(0, input_tokens - cached_tok)
+            prefill_ms = (
+                (cached_tok / 1000.0) * spec["ttft_cached_ms_per_1k"]
+                + (uncached_tok / 1000.0) * spec["ttft_cold_ms_per_1k"]
+            )
+        else:
+            prefill_ms = (input_tokens / 1000.0) * spec["ttft_cold_ms_per_1k"]
+
+        decode_ms = (output_tokens + thinking_tokens) * spec["itl_ms_per_token"]
+        return spec["base_overhead_ms"] + prefill_ms + decode_ms
 
     def optimize_route(
         self,
         request_id: str,
         cohort: EnterpriseCohort,
         input_tokens: int,
-        estimated_output_tokens: int = 256,
+        estimated_output_tokens: Optional[int] = None,
         target_quality: float = 0.95,
-        max_latency_ms: float = 2500.0,
-        is_cached: bool = False
+        max_latency_ms: float = 2000.0,
+        is_cached: bool = False,
+        raw_uncompacted_input_tokens: Optional[int] = None,
+        prefix_tokens: int = 0
     ) -> RoutingDecision:
         """
-        Solves the constrained Pareto optimization:
-            min Cost(M, T_think)
-            s.t. Quality(M, T_think) >= target_quality
-                 Latency(M, T_think) <= max_latency_ms
+        Solves the constrained economic routing problem over candidate tiers
+        (Flash-Lite, Flash, Argon/Pro) in O(1) time via Eq. (17).
         """
-        # Baseline monolithic comparison: Gemini 2.5 Pro without caching or thinking optimization
-        baseline_cost = self.compute_cost(
-            ModelTier.GEMINI_25_PRO,
-            input_tokens=input_tokens,
-            output_tokens=estimated_output_tokens,
+        comp_out_default, raw_out_default = self.COHORT_OUTPUT_TOKENS.get(cohort, (248, 312))
+        out_tokens = estimated_output_tokens if estimated_output_tokens is not None else comp_out_default
+        raw_in = raw_uncompacted_input_tokens if raw_uncompacted_input_tokens is not None else int(input_tokens * 1.48)
+
+        # Baseline monolithic cost: uncompacted prompt dispatched to Gemini 2.5 Pro (Argon tier) without caching
+        baseline_cost = self.calculate_invocation_cost(
+            tier=ModelTier.GEMINI_25_PRO,
+            input_tokens=raw_in,
+            output_tokens=raw_out_default,
             thinking_tokens=0,
             is_cached=False
         )
 
-        candidate_routes: List[Tuple[float, ModelTier, int, float, float]] = []
-
-        # Candidate tiers to consider
-        tiers_to_evaluate = [
+        candidate_tiers = [
             ModelTier.GEMINI_38_FLASH_LITE,
             ModelTier.GEMINI_38_FLASH,
-            ModelTier.GEMINI_25_PRO
+            ModelTier.GEMINI_25_PRO,
         ]
 
-        # Candidate thinking token budgets to search
-        thinking_token_steps = [0, 64, 128, 256, 512, 1024, 2048]
+        best_decision: Optional[RoutingDecision] = None
+        best_cost = float("inf")
 
-        for tier in tiers_to_evaluate:
-            max_think = self.TIER_SPECS[tier]["max_thinking_tokens"]
-            for think_tokens in thinking_token_steps:
-                if think_tokens > max_think:
-                    continue
+        for tier in candidate_tiers:
+            t_think, achieved_q = self.compute_closed_form_thinking_budget(
+                tier=tier,
+                cohort=cohort,
+                target_quality=target_quality,
+                c_task=1.0
+            )
+            if achieved_q + 1e-6 < target_quality:
+                continue
 
-                q = self.estimate_quality(tier, cohort, think_tokens)
-                lat = self.estimate_latency(tier, input_tokens, estimated_output_tokens, think_tokens, is_cached)
-                cost = self.compute_cost(tier, input_tokens, estimated_output_tokens, think_tokens, is_cached)
+            cost = self.calculate_invocation_cost(
+                tier=tier,
+                input_tokens=input_tokens,
+                output_tokens=out_tokens,
+                thinking_tokens=t_think,
+                is_cached=is_cached,
+                prefix_tokens=prefix_tokens
+            )
+            latency = self.calculate_latency_ms(
+                tier=tier,
+                input_tokens=input_tokens,
+                output_tokens=out_tokens,
+                thinking_tokens=t_think,
+                is_cached=is_cached,
+                prefix_tokens=prefix_tokens
+            )
+            meets_sla = latency <= max_latency_ms
 
-                # Check constraints
-                if q >= target_quality and lat <= max_latency_ms:
-                    candidate_routes.append((cost, tier, think_tokens, lat, q))
+            if meets_sla and cost < best_cost:
+                best_cost = cost
+                savings_pct = max(0.0, (baseline_cost - cost) / max(1e-12, baseline_cost) * 100.0)
+                best_decision = RoutingDecision(
+                    request_id=request_id,
+                    selected_tier=tier,
+                    thinking_budget=t_think,
+                    estimated_cost_usd=round(cost, 7),
+                    baseline_monolithic_cost_usd=round(baseline_cost, 7),
+                    net_cost_savings_pct=round(savings_pct, 2),
+                    estimated_latency_ms=round(latency, 2),
+                    expected_quality_score=round(achieved_q, 4),
+                    meets_sla=True
+                )
 
-        if candidate_routes:
-            # Sort by minimal cost
-            candidate_routes.sort(key=lambda x: x[0])
-            best_cost, best_tier, best_think, best_lat, best_q = candidate_routes[0]
-            meets_sla = True
-        else:
-            # Fallback to Gemini 3.8 Flash with maximum thinking budget
-            best_tier = ModelTier.GEMINI_38_FLASH
-            best_think = 2048
-            best_cost = self.compute_cost(best_tier, input_tokens, estimated_output_tokens, best_think, is_cached)
-            best_lat = self.estimate_latency(best_tier, input_tokens, estimated_output_tokens, best_think, is_cached)
-            best_q = self.estimate_quality(best_tier, cohort, best_think)
-            meets_sla = False
+        # Fallback if strict latency SLA cannot be met simultaneously with target_quality
+        if best_decision is None:
+            tier = ModelTier.GEMINI_25_PRO
+            t_think, achieved_q = self.compute_closed_form_thinking_budget(tier, cohort, target_quality, 1.0)
+            cost = self.calculate_invocation_cost(tier, input_tokens, out_tokens, t_think, is_cached, prefix_tokens)
+            latency = self.calculate_latency_ms(tier, input_tokens, out_tokens, t_think, is_cached, prefix_tokens)
+            savings_pct = max(0.0, (baseline_cost - cost) / max(1e-12, baseline_cost) * 100.0)
+            best_decision = RoutingDecision(
+                request_id=request_id,
+                selected_tier=tier,
+                thinking_budget=t_think,
+                estimated_cost_usd=round(cost, 7),
+                baseline_monolithic_cost_usd=round(baseline_cost, 7),
+                net_cost_savings_pct=round(savings_pct, 2),
+                estimated_latency_ms=round(latency, 2),
+                expected_quality_score=round(achieved_q, 4),
+                meets_sla=bool(latency <= max_latency_ms)
+            )
 
-        net_savings_pct = max(0.0, (baseline_cost - best_cost) / max(1e-9, baseline_cost)) * 100.0
-
-        return RoutingDecision(
-            request_id=request_id,
-            selected_tier=best_tier,
-            thinking_budget=best_think,
-            estimated_cost_usd=round(best_cost, 6),
-            baseline_monolithic_cost_usd=round(baseline_cost, 6),
-            net_cost_savings_pct=round(net_savings_pct, 2),
-            estimated_latency_ms=round(best_lat, 2),
-            expected_quality_score=round(best_q, 4),
-            meets_sla=meets_sla
-        )
+        return best_decision

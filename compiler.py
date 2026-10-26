@@ -10,7 +10,7 @@ attention-sink landmark injection, hardware paged cache alignment, and Pareto ro
 
 from __future__ import annotations
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from tokenomics_types import (
     PromptProfile,
     CompiledPrompt,
@@ -45,7 +45,7 @@ class TokenomicsCompiler:
         2. Mutual-information entropy pruning
         3. Attention-sink landmark injection
         4. Hardware page-block alignment
-        5. Convex Pareto economic routing
+        5. Closed-form Pareto economic routing
         """
         # Assemble raw text
         raw_parts = [profile.raw_instruction]
@@ -59,7 +59,7 @@ class TokenomicsCompiler:
 
         # Stage 1 & 2: Transpile schemas & prune conversational noise
         pruned_instruction, _, _, _ = self.pruner.prune_prompt(profile.raw_instruction)
-        
+
         canonical_schema_str = ""
         if profile.schema_definitions:
             canonical_schema_str, _, _ = self.transpiler.canonicalize_json_schema(profile.schema_definitions)
@@ -69,7 +69,6 @@ class TokenomicsCompiler:
         if canonical_schema_str:
             staged_text_parts.append(f"### CANONICAL SCHEMA CONTRACT:\n{canonical_schema_str}")
         if profile.context_payload:
-            # defragment context
             defrag_ctx, _, _ = self.transpiler.defragment_text(profile.context_payload)
             staged_text_parts.append(f"### VERIFIED INPUT PAYLOAD:\n{defrag_ctx}")
 
@@ -98,7 +97,7 @@ class TokenomicsCompiler:
             tokens_saved=tokens_saved,
             prefix_tokens=prefix_tokens,
             dynamic_suffix_tokens=dynamic_tokens,
-            cache_alignment_padding_tokens=0,
+            cache_alignment_padding_tokens=prefix_tokens % self.cache_aligner.block_size,
             effective_cache_hit_rate=0.85 if is_cache_eligible else 0.0
         )
 
@@ -115,15 +114,17 @@ class TokenomicsCompiler:
             is_cache_eligible=is_cache_eligible
         )
 
-        # Stage 5: Convex Pareto Economic Routing
+        # Stage 5: Closed-Form Pareto Economic Routing
         routing_decision = self.router.optimize_route(
             request_id=profile.request_id,
             cohort=profile.cohort,
             input_tokens=compacted_tokens,
-            estimated_output_tokens=256,
+            estimated_output_tokens=None,
             target_quality=profile.target_quality,
             max_latency_ms=profile.max_latency_ms,
-            is_cached=is_cache_eligible
+            is_cached=is_cache_eligible,
+            raw_uncompacted_input_tokens=raw_tokens,
+            prefix_tokens=prefix_tokens
         )
 
         return compiled_prompt, routing_decision

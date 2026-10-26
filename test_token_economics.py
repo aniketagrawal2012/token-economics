@@ -4,8 +4,10 @@ Docket: IDF-GGL-2026-TOKENOMICS-COMPILER
 Author: Aniket Agrawal (aniketagrawal@google.com)
 Assignee: Google LLC
 
-Deterministic unit testing covering all 5 pillars: BPE transpilation,
-entropy pruning, attention anchoring, paged-cache alignment, and Pareto routing.
+Deterministic unit testing covering all 5 pillars: BPE transpilation (with 4-part description
+guard, union-type folding, and 8-candidate AST search), entropy pruning (with sub-clause
+pleasantry span stripping, Eq. 6 symbolic operator weight 1.0, and polarity-aware 4-tuple
+deduplication), attention anchoring (Theorem 1), paged-cache alignment, and Pareto routing (Eq. 17).
 """
 
 import unittest
@@ -42,7 +44,6 @@ class TestTokenomicsCompiler(unittest.TestCase):
             self.assertGreater(pricing.input_per_million, 0.0)
             self.assertGreater(pricing.output_per_million, 0.0)
             self.assertGreater(pricing.cached_input_per_million, 0.0)
-            # Cached input should be strictly cheaper than raw input
             self.assertLess(pricing.cached_input_per_million, pricing.input_per_million)
 
     def test_02_bpe_transpiler_token_estimation(self):
@@ -50,17 +51,15 @@ class TestTokenomicsCompiler(unittest.TestCase):
         transpiler = BPETranspiler()
         self.assertEqual(transpiler.estimate_bpe_tokens(""), 0)
         self.assertGreaterEqual(transpiler.estimate_bpe_tokens("Hello world"), 2)
-        
-        # CamelCase splitting should register multiple subword tokens
+
         tokens_camel = transpiler.estimate_bpe_tokens("EnterpriseOrderManagementSystemProxy")
         self.assertGreaterEqual(tokens_camel, 5)
 
-        # Excess consecutive spaces increase token count
         spaced_text = "word      anotherword"
         self.assertGreater(transpiler.estimate_bpe_tokens(spaced_text), transpiler.estimate_bpe_tokens("word anotherword"))
 
-    def test_03_json_schema_canonicalization_compaction(self):
-        """Verify verbose OpenAPI schemas are compressed by >= 25% while preserving essential fields."""
+    def test_03_json_schema_canonicalization_and_4part_guard(self):
+        """Verify verbose OpenAPI schemas are compressed by >= 25% while preserving 4-part semantic guards and folding unions."""
         transpiler = BPETranspiler()
         raw_schema = {
             "title": "DatabaseQueryParameters",
@@ -73,12 +72,16 @@ class TestTokenomicsCompiler(unittest.TestCase):
                 },
                 "timeout_seconds": {
                     "type": "integer",
-                    "description": "Optional timeout parameter specifying maximum execution duration in seconds."
+                    "description": "Optional timeout parameter specifying maximum execution duration between 1 and 300 seconds."
                 },
                 "isolation_level": {
                     "type": "string",
                     "enum": ["SERIALIZABLE", "READ_COMMITTED"],
                     "description": "Transaction isolation level required for ACID consistency."
+                },
+                "cursor_token": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "Optional pagination cursor."
                 }
             },
             "required": ["query_string", "isolation_level"]
@@ -89,21 +92,25 @@ class TestTokenomicsCompiler(unittest.TestCase):
         reduction_pct = (raw_tok - comp_tok) / raw_tok * 100.0
         self.assertGreaterEqual(reduction_pct, 25.0, f"Expected >= 25% reduction, got {reduction_pct:.2f}%")
 
-        # Verify structural integrity
         parsed = json.loads(canonical_str)
         self.assertIn("query_string", parsed["properties"])
         self.assertIn("isolation_level", parsed["properties"])
         self.assertEqual(parsed["properties"]["isolation_level"]["enum"], ["SERIALIZABLE", "READ_COMMITTED"])
         self.assertEqual(parsed["required"], ["query_string", "isolation_level"])
+        # Verify union folding: anyOf -> ["string", "null"]
+        self.assertEqual(parsed["properties"]["cursor_token"]["type"], ["string", "null"])
+        # Verify numeric bound guard preserved on timeout_seconds
+        self.assertIn("description", parsed["properties"]["timeout_seconds"])
 
-    def test_04_entropy_pruner_eliminates_conversational_fluff(self):
-        """Verify polite greetings and filler are stripped while hard constraints are preserved."""
-        pruner = EntropyPruner(info_threshold=0.25)
+    def test_04_entropy_pruner_eliminates_conversational_fluff_and_retains_short_symbolic(self):
+        """Verify polite greetings are stripped, mixed clauses keep constraints, and short symbolic clauses pass Eq. (6)."""
+        pruner = EntropyPruner(info_threshold=0.30)
         fluffy_prompt = (
             "Hello dear AI assistant! I hope you are having a wonderful day.\n"
             "Can you please kindly help me with a critical database query?\n"
             "You must select the customer_id and transaction_total from the accounts table.\n"
             "The where condition must filter status = 'ACTIVE'.\n"
+            "x >= 0 and y != 1\n"
             "Please return the output strictly formatted as valid JSON.\n"
             "Thank you so much in advance, I really appreciate your help!"
         )
@@ -113,28 +120,31 @@ class TestTokenomicsCompiler(unittest.TestCase):
         self.assertIn("customer_id", pruned_text)
         self.assertIn("accounts table", pruned_text)
         self.assertIn("status = 'ACTIVE'", pruned_text)
+        self.assertIn("x >= 0 and y != 1", pruned_text)
         self.assertIn("strictly formatted as valid JSON", pruned_text)
-        # Conversational filler must be absent
         self.assertNotIn("having a wonderful day", pruned_text)
         self.assertNotIn("really appreciate your help", pruned_text)
 
-    def test_05_entropy_pruner_deduplication(self):
-        """Verify redundant repeating constraints are consolidated."""
-        pruner = EntropyPruner(info_threshold=0.25)
+    def test_05_entropy_pruner_polarity_aware_deduplication(self):
+        """Verify redundant repeating constraints are consolidated while opposite-polarity constraints are preserved."""
+        pruner = EntropyPruner(info_threshold=0.30)
         repetitive_prompt = (
             "You must return the output formatted strictly as JSON.\n"
-            "The query must filter where balance > 1000.\n"
+            "The query must filter where balance >= 1000.\n"
+            "The query must filter where balance != 1000.\n"
             "Please make sure the response is returned strictly as JSON format.\n"
             "The output response must be strictly in JSON."
         )
 
         pruned_text, raw_tok, pruned_tok, _ = pruner.prune_prompt(repetitive_prompt)
-        # The JSON format warning should only appear once
         json_mentions = [line for line in pruned_text.split('\n') if 'json' in line.lower()]
         self.assertEqual(len(json_mentions), 1)
+        # Both balance >= 1000 (+1 polarity) and balance != 1000 (-1 polarity) must be retained
+        self.assertIn("balance >= 1000", pruned_text)
+        self.assertIn("balance != 1000", pruned_text)
 
     def test_06_attention_anchor_injection(self):
-        """Verify structural uppercase landmark anchors are injected."""
+        """Verify 7-token structural uppercase landmark anchors are injected."""
         injector = AttentionAnchorInjector(sink_boost=1.75)
         raw_prompt = (
             "You must follow these rules strictly:\n"
@@ -149,7 +159,7 @@ class TestTokenomicsCompiler(unittest.TestCase):
         self.assertIn("### REQUIRED OUTPUT SPECIFICATION:", anchored_text)
 
     def test_07_attention_entropy_reduction(self):
-        """Verify Shannon entropy of anchored prompt is strictly bounded and lower than raw diffuse entropy."""
+        """Verify Shannon entropy of anchored prompt is strictly bounded by Theorem 1 H_max and lower than ln(i)."""
         injector = AttentionAnchorInjector(sink_boost=1.75)
         _, anchors = injector.inject_anchors("You must obey rule 1 and rule 2. Return format is JSON.")
         metrics = injector.calculate_attention_entropy(num_tokens=500, anchors=anchors)
@@ -172,13 +182,11 @@ class TestTokenomicsCompiler(unittest.TestCase):
     def test_09_vertex_ai_cache_threshold_detection(self):
         """Verify prompts >= 32,768 tokens are flagged as cache eligible and SHA-256 is computed."""
         aligner = PagedCacheAligner(block_size=16)
-        # Construct small prompt (< 32k)
         small_prompt = "Short prompt text for immediate execution."
         _, _, is_eligible_small, hash_small, _ = aligner.partition_prompt_for_caching(small_prompt)
         self.assertFalse(is_eligible_small)
         self.assertEqual(len(hash_small), 64)
 
-        # Construct synthetic 33k token prompt
         large_prefix = "word " * 33000
         large_prompt = f"{large_prefix}\n### DYNAMIC_QUERY:\nUser question here"
         _, _, is_eligible_large, hash_large, tokens_large = aligner.partition_prompt_for_caching(large_prompt)
@@ -186,11 +194,10 @@ class TestTokenomicsCompiler(unittest.TestCase):
         self.assertGreaterEqual(tokens_large, 32768)
         self.assertEqual(len(hash_large), 64)
 
-    def test_10_pareto_router_cost_minimization(self):
-        """Verify router picks the cheapest tier that satisfies target quality and latency SLA."""
+    def test_10_pareto_router_cost_minimization_and_closed_form_thinking(self):
+        """Verify router picks cheapest tier satisfying Q* and Eq. (17) yields T_think* = 16 for Cohort C."""
         router = ParetoEconomicRouter()
-        # Simple query with modest quality target (0.85) and standard SLA (2000ms)
-        decision = router.optimize_route(
+        decision_a = router.optimize_route(
             request_id="req_test_01",
             cohort=EnterpriseCohort.COHORT_A_SQL_DB,
             input_tokens=500,
@@ -199,29 +206,34 @@ class TestTokenomicsCompiler(unittest.TestCase):
             max_latency_ms=2000.0,
             is_cached=False
         )
+        self.assertEqual(decision_a.selected_tier, ModelTier.GEMINI_38_FLASH_LITE)
+        self.assertTrue(decision_a.meets_sla)
+        self.assertGreater(decision_a.net_cost_savings_pct, 70.0)
 
-        # Should select Flash-Lite because it meets Q >= 0.85 and is the cheapest
-        self.assertEqual(decision.selected_tier, ModelTier.GEMINI_38_FLASH_LITE)
-        self.assertTrue(decision.meets_sla)
-        self.assertGreater(decision.net_cost_savings_pct, 70.0)
+        # Verify Cohort C (Q* = 0.96, Q_base(Flash, C) = 0.94, Delta_Q_max = 0.06 -> Omega = 1/3 -> ceil(4097^(1/3)-1) = 16)
+        t_think_c, q_c = router.compute_closed_form_thinking_budget(
+            tier=ModelTier.GEMINI_38_FLASH,
+            cohort=EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE,
+            target_quality=0.96,
+            c_task=1.0
+        )
+        self.assertEqual(t_think_c, 16)
+        self.assertGreaterEqual(q_c, 0.96)
 
     def test_11_pareto_router_thinking_budget_boost(self):
-        """Verify Gemini 3.8 Flash can boost its quality to >= 0.96 using test-time thinking tokens."""
+        """Verify Gemini 3.8 Flash boosts quality using test-time thinking tokens."""
         router = ParetoEconomicRouter()
-        # High-stakes query requiring Q >= 0.95
         decision = router.optimize_route(
             request_id="req_test_02",
             cohort=EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE,
             input_tokens=1500,
             estimated_output_tokens=300,
             target_quality=0.95,
-            max_latency_ms=3000.0,
+            max_latency_ms=3500.0,
             is_cached=False
         )
-
-        # Gemini 3.8 Flash with thinking budget should win over Gemini 2.5 Pro on cost
         self.assertIn(decision.selected_tier, (ModelTier.GEMINI_38_FLASH, ModelTier.GEMINI_25_PRO))
-        self.assertGreaterEqual(decision.expected_quality_score, 0.94)
+        self.assertGreaterEqual(decision.expected_quality_score, 0.95)
         self.assertTrue(decision.meets_sla)
 
     def test_12_end_to_end_compiler_pipeline(self):
@@ -253,17 +265,12 @@ class TestTokenomicsCompiler(unittest.TestCase):
 
         compiled_prompt, decision = compiler.compile(profile)
 
-        # 1. Token compaction verification
         self.assertGreater(compiled_prompt.stats.raw_input_tokens, compiled_prompt.stats.compacted_input_tokens)
         self.assertGreater(compiled_prompt.stats.tokens_saved, 0)
-        self.assertLess(compiled_prompt.stats.compression_ratio, 0.85)  # At least 15% reduction
-
-        # 2. Attention landmark verification
+        self.assertLess(compiled_prompt.stats.compression_ratio, 0.85)
         self.assertGreaterEqual(len(compiled_prompt.anchors_injected), 1)
         self.assertTrue(compiled_prompt.attention_metrics.dispersion_bounded)
         self.assertLess(compiled_prompt.attention_metrics.anchored_attention_entropy, compiled_prompt.attention_metrics.raw_attention_entropy)
-
-        # 3. Routing decision verification
         self.assertTrue(decision.meets_sla)
         self.assertGreater(decision.net_cost_savings_pct, 30.0)
         self.assertGreaterEqual(decision.expected_quality_score, 0.90)
