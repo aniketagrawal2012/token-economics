@@ -15,9 +15,10 @@ Implements Stage 5 of the Tokenomics Compiler:
 """
 
 from __future__ import annotations
+import json
 import math
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from tokenomics_types import (
     ModelTier,
     PricingSpec,
@@ -43,6 +44,27 @@ class ParetoEconomicRouter:
         EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE: (480, 580),
         EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING: (240, 300),
     }
+
+    @classmethod
+    def get_expected_output_tokens(
+        cls,
+        cohort: EnterpriseCohort,
+        is_compacted: bool = True,
+        is_cyclic: bool = False,
+        format_matched_diff: bool = False
+    ) -> int:
+        """
+        Returns compaction- and cyclicity-conditioned expected output tokens L_hat_out(M, x, c) (#4, #22).
+        For Cohort D, acyclic unified-diff output is 480 tokens (or 502 tokens for format-matched
+        uncompacted unified-diff baseline) vs. 620 tokens for cyclic full-module refactoring.
+        """
+        if cohort == EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE:
+            if is_cyclic:
+                return 620
+            if not is_compacted and format_matched_diff:
+                return 502
+        comp_tok, raw_tok = cls.COHORT_OUTPUT_TOKENS.get(cohort, (248, 312))
+        return comp_tok if is_compacted else raw_tok
 
     # Empirical latency and quality response surface per model tier
     TIER_SPECS: Dict[ModelTier, Dict[str, Any]] = {
@@ -314,6 +336,7 @@ class ParetoEconomicRouter:
 
         best_decision: Optional[RoutingDecision] = None
         best_cost = float("inf")
+        quality_feasible_decisions: list[RoutingDecision] = []
 
         for tier in candidate_tiers:
             t_think, achieved_q = self.compute_closed_form_thinking_budget(
@@ -342,9 +365,35 @@ class ParetoEconomicRouter:
                 prefix_tokens=prefix_tokens
             )
             meets_sla = latency <= max_latency_ms
+            savings_pct = max(0.0, (baseline_cost - cost) / max(1e-12, baseline_cost) * 100.0)
+            cand_decision = RoutingDecision(
+                request_id=request_id,
+                selected_tier=tier,
+                thinking_budget=t_think,
+                estimated_cost_usd=round(cost, 7),
+                baseline_monolithic_cost_usd=round(baseline_cost, 7),
+                net_cost_savings_pct=round(savings_pct, 2),
+                estimated_latency_ms=round(latency, 2),
+                expected_quality_score=round(achieved_q, 4),
+                meets_sla=bool(meets_sla)
+            )
+            quality_feasible_decisions.append(cand_decision)
 
             if meets_sla and cost < best_cost:
                 best_cost = cost
+                best_decision = cand_decision
+
+        # Two-stage fallback rule (#4):
+        # 1. If M_qual != empty but all violate latency SLA, select min-latency tier in M_qual.
+        # 2. If M_qual == empty, select max-quality tier (Argon/Pro at T_max).
+        if best_decision is None:
+            if quality_feasible_decisions:
+                best_decision = min(quality_feasible_decisions, key=lambda d: d.estimated_latency_ms)
+            else:
+                tier = ModelTier.GEMINI_25_PRO
+                t_think, achieved_q = self.compute_closed_form_thinking_budget(tier, cohort, target_quality, 1.0)
+                cost = self.calculate_invocation_cost(tier, input_tokens, out_tokens, t_think, is_cached, prefix_tokens)
+                latency = self.calculate_latency_ms(tier, input_tokens, out_tokens, t_think, is_cached, prefix_tokens)
                 savings_pct = max(0.0, (baseline_cost - cost) / max(1e-12, baseline_cost) * 100.0)
                 best_decision = RoutingDecision(
                     request_id=request_id,
@@ -355,26 +404,8 @@ class ParetoEconomicRouter:
                     net_cost_savings_pct=round(savings_pct, 2),
                     estimated_latency_ms=round(latency, 2),
                     expected_quality_score=round(achieved_q, 4),
-                    meets_sla=True
+                    meets_sla=bool(latency <= max_latency_ms)
                 )
 
-        # Fallback if strict latency SLA cannot be met simultaneously with target_quality
-        if best_decision is None:
-            tier = ModelTier.GEMINI_25_PRO
-            t_think, achieved_q = self.compute_closed_form_thinking_budget(tier, cohort, target_quality, 1.0)
-            cost = self.calculate_invocation_cost(tier, input_tokens, out_tokens, t_think, is_cached, prefix_tokens)
-            latency = self.calculate_latency_ms(tier, input_tokens, out_tokens, t_think, is_cached, prefix_tokens)
-            savings_pct = max(0.0, (baseline_cost - cost) / max(1e-12, baseline_cost) * 100.0)
-            best_decision = RoutingDecision(
-                request_id=request_id,
-                selected_tier=tier,
-                thinking_budget=t_think,
-                estimated_cost_usd=round(cost, 7),
-                baseline_monolithic_cost_usd=round(baseline_cost, 7),
-                net_cost_savings_pct=round(savings_pct, 2),
-                estimated_latency_ms=round(latency, 2),
-                expected_quality_score=round(achieved_q, 4),
-                meets_sla=bool(latency <= max_latency_ms)
-            )
-
         return best_decision
+

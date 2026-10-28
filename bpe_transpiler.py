@@ -43,12 +43,24 @@ class BPETranspiler:
         "readOnly", "writeOnly", "externalDocs", "additionalProperties"
     }
 
-    # (a) Format / Regex / Encoding indicators in descriptions
+    # (a) Format / Regex / Encoding indicators in descriptions (#7: \$(?!\d) avoids currency match)
     REGEX_FORMAT_PATTERNS = re.compile(
-        r"(\b(?:iso-?8601|rfc-?\d+|uuid|ipv4|ipv6|base64|hex|utf-?8|ascii|parquet|csv|xml|"
-        r"yyyy-mm-dd|hh:mm:ss|utc|epoch|regex|pattern)\b|\^[^\s]+|\$[a-z0-9_]+)",
+        r"(\^(?!\s)|\$(?!\d)|(?:max|min)?len(?:gth)?\s*[:=]?\s*\d+|\b(?:iso-?\d+|rfc\s*\d+|uuid|"
+        r"ipv4|ipv6|base64|hex|utf-?8|ascii|parquet|csv|xml|yyyy-mm-dd|hh:mm:ss|utc|gmt|epoch|"
+        r"regex|format|pattern)\b)",
         re.IGNORECASE
     )
+
+    # 64-word deterministic stopword/filler set stripped during sub-ms head noun-phrase extraction (#5)
+    FUNCTION_STOPWORDS = {
+        "a", "an", "the", "this", "that", "these", "those", "is", "are", "was", "were", "be",
+        "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "should",
+        "can", "could", "may", "might", "used", "to", "for", "of", "in", "on", "at", "by",
+        "with", "about", "as", "into", "like", "through", "after", "over", "under", "again",
+        "further", "then", "once", "here", "there", "all", "any", "both", "each", "more",
+        "most", "other", "some", "such", "specify", "specifies", "represents", "representing",
+        "indicates", "indicating", "parameter", "field", "value", "contains", "containing", "which",
+    }
 
     # (b) Numeric bounds / physical or financial units in descriptions
     NUMERIC_UNIT_PATTERNS = re.compile(
@@ -112,6 +124,24 @@ class BPETranspiler:
         return tokens[-1] if tokens else prop_name.lower()
 
     @classmethod
+    def extract_head_noun_phrase(cls, text: str, max_words: int = 6) -> str:
+        """
+        Deterministic O(|text|) head noun-phrase / content-word extractor (#5):
+        Strips the 64-word function/filler stopword set and retains up to `max_words`
+        content tokens from the leading clause without invoking a neural POS tagger.
+        """
+        if not text:
+            return ""
+        first_clause = re.split(r"[.;]", text.strip())[0].strip()
+        words = first_clause.split()
+        content_words = [
+            w for w in words
+            if re.sub(r"[^a-z0-9]", "", w.lower()) not in cls.FUNCTION_STOPWORDS
+        ]
+        selected = content_words[:max_words] if content_words else words[:max_words]
+        return " ".join(selected)
+
+    @classmethod
     def has_semantic_guard_in_description(
         cls,
         desc: str,
@@ -163,6 +193,8 @@ class BPETranspiler:
             has_oov_guard = False
 
         if has_numeric or has_sibling_role or has_oov_guard or _has_nontrivial_format_or_deontic(has_format, has_deontic, prop_name, clean_desc):
+            if has_sibling_role and not (has_numeric or has_format or has_deontic):
+                return True, cls.extract_head_noun_phrase(clean_desc, max_words=6)
             clauses = re.split(r'[.;]', clean_desc)
             kept = [c.strip() for c in clauses if c.strip()]
             summary = kept[0] if kept else clean_desc
@@ -174,26 +206,34 @@ class BPETranspiler:
         return False, ""
 
     @classmethod
-    def delta_tokenize_key_boundary(cls, key_name: str, is_first_key: bool = False) -> int:
+    def delta_tokenize_key_boundary(
+        cls,
+        key_name: str,
+        is_first_key: bool = False,
+        is_last_key: bool = False
+    ) -> int:
         """
         Evaluates subword token count across the quotation-synchronized key-delimiter transition span
-        ('{"<key>":' or ',"<key>":') anchored at '"' Viterbi lattice synchronization barriers (#6).
+        ('{"<key>":' or ',"<key>":', plus closing '",' vs '"}' terminal transition when is_last_key is set)
+        anchored at '"' Viterbi lattice synchronization barriers (#3, #6).
         For long keys (>8 chars), uses a 4-character boundary pre-filter around '{"' / ',"' plus
         invariant stem caching.
         """
         prefix_delim = '{"' if is_first_key else ',"'
+        suffix_delim = '"}' if is_last_key else '",'
         if len(key_name) > 8:
             boundary_window = prefix_delim + key_name[:2]
-            stem_window = key_name[2:] + '":'
+            stem_window = key_name[2:] + '":' + suffix_delim
             return cls.count_tokens(boundary_window) + cls.count_tokens(stem_window)
-        full_transition = f'{prefix_delim}{key_name}":'
+        full_transition = f'{prefix_delim}{key_name}":{suffix_delim}'
         return cls.count_tokens(full_transition)
 
     @classmethod
     def _hoist_repeated_subtrees(cls, root_ast: Dict[str, Any], min_tokens: int = 24) -> Dict[str, Any]:
         """
-        Implements AST Switch (ii): hoists identical post-pruning object sub-trees of >= min_tokens
-        that repeat >= 2 times into top-level '$defs' with '{"$ref":"#/$defs/..."}' pointers (#6).
+        Implements global AST Switch (ii): hoists identical post-pruning object sub-trees of >= min_tokens
+        that repeat >= 2 times into a single shared top-level '$defs' container with '{"$ref":"#/$defs/..."}'
+        pointers, amortizing the 5-token outer '"$defs":{}' wrapper overhead across all hoisted nodes (#3, #6).
         """
         if not isinstance(root_ast, dict) or "properties" not in root_ast or not isinstance(root_ast["properties"], dict):
             return root_ast

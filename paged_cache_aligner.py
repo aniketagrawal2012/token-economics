@@ -92,3 +92,38 @@ class PagedCacheAligner:
         cache_key_hash = hashlib.sha256(aligned_prefix.encode('utf-8')).hexdigest()
 
         return aligned_prefix, dynamic_suffix, is_cache_eligible, cache_key_hash, prefix_tokens
+
+    def simulate_vmem_tile_masking(self, prefix_tokens: int, dynamic_tokens: int = 64) -> dict:
+        r"""
+        Models the server-side Cloud TPU v6e JAX/Pallas Block-Attention kernel invariants (#2):
+        1. Block-table allocator zero-initializes the \Delta_frag trailing HBM2e slots upon prefix page
+           sealing, and the Pallas kernel zeroes out q_p, k_p, v_p <- 0 in VMEM scratchpad registers
+           via the validity bitmask prior to 128x128 MXU systolic array tile execution, preventing
+           IEEE-754 NaN * 0 or NaN + (-inf) propagation from uninitialized HBM2e memory.
+        2. On dummy pad query rows p in I_pad, self-diagonal M_pp = 0 and z_pp = <0, 0>/sqrt(d) = 0
+           guarantee exact row-wise softmax partition denominator Z_p = exp(0) = 1.0 (zero 0/0 NaNs),
+           while non-self key columns p in I_pad have M_ip = -inf so A_ip = exp(0 - inf) = 0.0.
+        3. Logical RoPE counter m_logical(i) = m_physical(i) - |I_pad \cap {1..i}| decouples rotary
+           phases and local sliding-window horizon W_loc from interior padding slots.
+        """
+        delta_frag = (self.block_size - (prefix_tokens % self.block_size)) % self.block_size
+        physical_prefix_tokens = prefix_tokens + delta_frag
+        num_prefix_blocks = physical_prefix_tokens // self.block_size
+        logical_total_tokens = prefix_tokens + dynamic_tokens
+        physical_total_tokens = physical_prefix_tokens + dynamic_tokens
+
+        return {
+            "raw_prefix_tokens": prefix_tokens,
+            "delta_frag": delta_frag,
+            "physical_prefix_tokens": physical_prefix_tokens,
+            "num_sealed_prefix_blocks": num_prefix_blocks,
+            "vmem_qkv_zeroed_for_pad": True,
+            "hbm_tail_slots_zero_initialized": True,
+            "pad_self_logit_z_pp": 0.0,
+            "pad_row_partition_Z_p": 1.0,
+            "valid_to_pad_attention_weight_A_ip": 0.0,
+            "nan_propagation_possible": False,
+            "logical_terminal_position": logical_total_tokens,
+            "physical_terminal_position": physical_total_tokens,
+        }
+

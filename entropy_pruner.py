@@ -26,26 +26,47 @@ class EntropyPruner:
     Information-theoretic prompt pruner and polarity-aware constraint deduplicator.
     """
 
-    # 18 Conversational pleasantry & filler span templates stripped at sub-clause level
+    # 18 Conversational pleasantry & persona templates stripped at sub-clause level (#5)
+    PLEASANTRY_TEMPLATES_18 = (
+        "please kindly",
+        "thank you in advance",
+        "as a helpful ai assistant",
+        "i would like you to",
+        "could you please",
+        "make sure to carefully",
+        "i really appreciate your help",
+        "if it is not too much trouble",
+        "you are an expert world-class",
+        "take a deep breath and",
+        "think step by step and",
+        "hope you are doing well",
+        "please be so kind as to",
+        "it is very important that you",
+        "for a $200 tip please",
+        "hello there assistant",
+        "thank you so much for",
+        "we kindly request that you",
+    )
+
     PLEASANTRY_SPAN_PATTERNS = [
-        r"^\s*hello(?:\s+dear|\s+team|\s+google\s+cloud[^.!?\n]*)?[!,.]*\s*",
+        r"^\s*hello(?:\s+there\s+assistant|\s+dear|\s+team|\s+google\s+cloud[^.!?\n]*)?[!,.]*\s*",
         r"^\s*hi\s+there[!,.]*\s*",
         r"^\s*greetings(?:\s+agent\s+controller)?[!,.]*\s*",
         r"^\s*dear\s+[a-z\s]+(?:assistant|controller|team|support)[!,.]*\s*",
         r"\bi\s+hope\s+you\s+are\s+(?:having\s+a\s+wonderful\s+day|doing\s+well)[!,.]*\s*",
-        r"\bhope\s+you\s+have\s+a\s+great\s+day[!,.]*\s*",
-        r"\bcan\s+you\s+please\s+kindly\s+help\s+me\s+with[^?.!]*[?.!]\s*",
-        r"\bthank\s+you\s+(?:so\s+much|very\s+much)?(?:\s+in\s+advance)?[^.!?\n]*[!.]*\s*",
+        r"\bhope\s+you\s+(?:are\s+doing\s+well|have\s+a\s+great\s+day)[!,.]*\s*",
+        r"\b(?:can|could)\s+you\s+please(?:\s+kindly)?(?:\s+help\s+me\s+with[^?.!]*[?.!])?\s*",
+        r"\bthank\s+you\s+(?:so\s+much(?:\s+for)?|very\s+much)?(?:\s+in\s+advance)?[^.!?\n]*[!.]*\s*",
         r"\bi\s+really\s+appreciate\s+your\s+(?:help|assistance)[^.!?\n]*[!.]*\s*",
         r"\bthanks\s+a\s+lot[^.!?\n]*[!.]*\s*",
-        r"\bplease\s+make\s+sure\s+to\s+carefully\b",
-        r"\bplease\s+make\s+sure\s+(?:that\s+)?(?:the\s+response\s+is\s+)?",
+        r"\b(?:please\s+)?make\s+sure\s+to\s+carefully\b",
+        r"\bplease\s+(?:kindly|be\s+so\s+kind\s+as\s+to|make\s+sure\s+(?:that\s+)?(?:the\s+response\s+is\s+)?)\b",
         r"\bplease\s+ensure\s+that\s+the\s+query\s+is\s+formatted\s+cleanly[.!]*\s*",
         r"\bkindly\s+process\s+this\s+user\s+transaction\s+via\s+available\s+api\s+tools[.!]*\s*",
-        r"\bas\s+an\s+ai\s+assistant[,]*\s*",
-        r"\bif\s+you\s+don't\s+mind[,]*\s*",
-        r"\bwould\s+you\s+be\s+so\s+kind\s+as\s+to\b",
-        r"\bi\s+would\s+like\s+to\s+request\s+that\s+you\b",
+        r"\bas\s+a(?:n)?\s+(?:helpful\s+)?ai\s+assistant[,]*\s*",
+        r"\b(?:if\s+you\s+don't\s+mind|if\s+it\s+is\s+not\s+too\s+much\s+trouble)[,]*\s*",
+        r"\b(?:you\s+are\s+an\s+expert\s+world-class|take\s+a\s+deep\s+breath\s+and|think\s+step\s+by\s+step\s+and)\b",
+        r"\b(?:i\s+would\s+like\s+(?:you\s+to|to\s+request\s+that\s+you)|we\s+kindly\s+request\s+that\s+you|it\s+is\s+very\s+important\s+that\s+you|for\s+a\s+\$200\s+tip\s+please)\b",
     ]
 
     # 64-token deterministic invariant lexicon K_inv across 4 sub-lexicons (matched case-insensitively, #11)
@@ -64,7 +85,7 @@ class EntropyPruner:
         "schema", "pattern", "minimum", "maximum", "integer", "boolean", "string", "utc",
     }
 
-    # 28-operator symbolic/structural lexicon S_sym (#11)
+    # 28-operator symbolic/structural lexicon S_sym (#8, #11)
     S_SYM_OPERATORS = {
         "=", "==", "!=", "<>", "<", ">", "<=", ">=", "IN", "NOT IN", "LIKE",
         "IS NULL", "NOT NULL", "::", "->", "=>", "+", "-", "*", "/", "%",
@@ -114,6 +135,9 @@ class EntropyPruner:
         r"""
         Evaluates Eq. (6) on residual sub-clause \tilde{c}_k:
           D_inv(\tilde{c}_k) = (2.0 * Count(\tilde{c}_k, K_inv) + 1.0 * Count(\tilde{c}_k, S_sym)) / (|T_M(\tilde{c}_k)| + 1)
+        Enforces strict case-sensitive word-boundary guards on alphabetic SQL operators
+        ('IN', 'NOT IN', 'LIKE', 'IS NULL', 'NOT NULL') so lowercase English prepositions
+        ('in', 'like') are not miscounted as symbolic operators (#8).
         Returns (d_inv, k_inv_count, s_sym_count, tok_count).
         """
         if not cleaned_clause:
@@ -122,10 +146,11 @@ class EntropyPruner:
         words_lower = [w.strip("'") for w in re.findall(r"[a-z0-9_']+", cleaned_clause.lower())]
         k_inv_count = sum(1 for w in words_lower if w in self.active_k_inv)
 
-        upper_clause = cleaned_clause.upper()
-        multi_word_ops = sum(upper_clause.count(op) for op in ("NOT IN", "IS NULL", "NOT NULL"))
+        # Case-sensitive non-overlapping phrase/word-boundary matches for alphabetic SQL operators (#8)
+        multi_word_ops = len(re.findall(r"\b(?:NOT\s+IN|IS\s+NULL|NOT\s+NULL)\b", cleaned_clause))
+        residual_for_single_ops = re.sub(r"\b(?:NOT\s+IN|IS\s+NULL|NOT\s+NULL)\b", " ", cleaned_clause)
+        word_ops = len(re.findall(r"\b(?:IN|LIKE)\b", residual_for_single_ops))
         sym_tokens = re.findall(r"(?:>=|<=|!=|==|<>|&&|\|\||->|=>|::|[=><+\-*/%!{}\[\]])", cleaned_clause)
-        word_ops = sum(1 for w in words_lower if w in ("in", "like"))
         s_sym_count = multi_word_ops + len(sym_tokens) + word_ops
 
         weighted_num = 2.0 * k_inv_count + 1.0 * s_sym_count
@@ -238,10 +263,63 @@ class EntropyPruner:
 
         return frozenset(tuples)
 
+    @classmethod
+    def strip_duplicate_signature_spans(
+        cls,
+        clause: str,
+        seen_signatures: Set[Tuple[str, int, str, str]]
+    ) -> Tuple[str, FrozenSet[Tuple[str, int, str, str]]]:
+        """
+        Strips already-seen 4-tuple predicate spans at their local [attr, op, val] boundaries
+        while preserving shared clause-initial deontic/negative modals (e.g., 'must never set')
+        and trimming dangling coordinating conjunctions ('or', 'nor', 'and', ',') on surviving
+        conjuncts (#5).
+        """
+        sig = cls.extract_polarity_signature(clause)
+        if not sig or not seen_signatures:
+            return clause, sig
+        sig_new = set(sig) - seen_signatures
+        if not sig_new:
+            return "", frozenset()
+        if len(sig_new) == len(sig):
+            return clause, sig
+
+        lower = clause.lower().strip()
+        clause_level_neg = bool(re.search(
+            r"\b(?:never|not|cannot|do\s+not|don't|prohibit(?:ed)?|forbid(?:den)?|disallow(?:ed)?|"
+            r"exclude|omit|reject|deny|prevent|without|none|neither)\b",
+            lower
+        ))
+        residual = clause
+        rel_iter = list(re.finditer(
+            r"([a-zA-Z_][a-zA-Z0-9_.]*)\s*(>=|<=|!=|==|<>|=|>|<)\s*('[^']*'|\"[^\"]*\"|[a-zA-Z0-9_.-]+)",
+            clause
+        ))
+        for m in reversed(rel_iter):
+            attr, op, val = m.group(1), m.group(2), m.group(3)
+            prefix_window = clause[max(0, m.start() - 40):m.start()].lower()
+            local_neg = bool(re.search(
+                r"\b(?:never|not|cannot|do\s+not|don't|prohibit(?:ed)?|forbid(?:den)?|disallow(?:ed)?|without|neither|nor)\b",
+                prefix_window
+            ))
+            rel_pol = -1 if (op in ("!=", "<>") or local_neg or clause_level_neg) else +1
+            norm_op = "=" if op in ("==", "!=", "<>") else op
+            tup = (attr.lower(), rel_pol, norm_op, val.strip("'\"").lower())
+            if tup in seen_signatures:
+                start, end = m.span()
+                residual = residual[:start] + " " + residual[end:]
+
+        # Clean up dangling conjunctions left adjacent to excised spans while keeping prefix modals
+        residual = re.sub(r"\b(?:set|where|with)\s+(?:or|nor|and|,)\s+", lambda m: m.group(0).split()[0] + " ", residual, flags=re.I)
+        residual = re.sub(r",\s*(?:or|nor|and)\s*$", "", residual.strip(), flags=re.I)
+        residual = re.sub(r"\s+(?:or|nor|and)\s*$", "", residual.strip(), flags=re.I)
+        residual = re.sub(r"\s{2,}", " ", residual).strip(" ,;-")
+        return residual, frozenset(sig_new)
+
     def prune_prompt(self, raw_prompt: str) -> Tuple[str, int, int, float]:
         """
         Executes Stage 2 (Pleasantry Span Stripping + Invariant Density Pruning + 4-Tuple Deduplication).
-        Emits span-stripped residual clause c_tilde_k into I_inv when Retain(c_k) holds (#2).
+        Emits span-stripped residual clause c_tilde_k into I_inv when Retain(c_k) holds (#2, #5).
         Returns (pruned_prompt, raw_tokens, pruned_tokens, compression_ratio).
         """
         if not raw_prompt:
@@ -269,20 +347,17 @@ class EntropyPruner:
                 if not cleaned_sc or len(cleaned_sc) < 3:
                     continue
 
-                sig = self.extract_polarity_signature(cleaned_sc)
-                sig_new = set(sig) - seen_signatures if sig else set()
-                has_novel_sig = len(sig_new) > 0
-
-                # If all extracted tuples in sig were already seen, fold duplicate constraint (#2)
-                if sig and not has_novel_sig:
+                cleaned_sc, sig_new = self.strip_duplicate_signature_spans(cleaned_sc, seen_signatures)
+                if not cleaned_sc:
                     continue
+                has_novel_sig = len(sig_new) > 0
 
                 info_score, tau_eff, _, has_hard_inv = self.compute_clause_information_score(cleaned_sc)
                 retain = self.evaluate_retention_predicate(cleaned_sc, has_novel_sig=False) or has_hard_inv or (info_score >= tau_eff)
 
                 if retain:
-                    if sig:
-                        seen_signatures.update(sig)
+                    if sig_new:
+                        seen_signatures.update(sig_new)
                     kept_in_line.append(cleaned_sc)
 
             if kept_in_line:

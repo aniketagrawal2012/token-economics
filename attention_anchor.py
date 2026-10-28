@@ -54,18 +54,64 @@ class AttentionAnchorInjector:
     @staticmethod
     def compute_theoretical_h_max(i_len: float, k_tokens: float = 7.0, gamma: float = 100.0) -> float:
         r"""
-        Evaluates Eq. (15) exact analytic upper bound on dispersive self-attention Shannon entropy (#4, #5):
+        Evaluates Eq. (15) exact analytic upper bound on dispersive self-attention Shannon entropy (#4, #5, #21):
           H_max(i, K, \gamma) = ln(Z_i) - (K * \gamma * ln(\gamma)) / Z_i
         where Z_i = K * \gamma + (i - K) for i > K > 0 and \gamma > 1.
         At i = W_loc = 450, K = 7, \gamma = 100: Z_450 = 1143, H_max = 4.2229 nats (\approx 4.22 nats;
-        4.25 nats at effective window i = W_loc + K = 457).
+        4.2444 \approx 4.24 nats at effective window i = W_loc + K = 457).
         """
         if i_len <= k_tokens or gamma <= 1.0:
             return math.log(max(1.0, float(i_len)))
         z_i = float(k_tokens) * float(gamma) + (float(i_len) - float(k_tokens))
         return math.log(z_i) - (float(k_tokens) * float(gamma) * math.log(float(gamma))) / z_i
 
-    def inject_anchors(self, prompt_text: str) -> Tuple[str, List[AttentionAnchor]]:
+    @staticmethod
+    def compute_continuous_density_asymptote(
+        n_tokens: float,
+        rho_s: float = 7.0 / 450.0,
+        gamma: float = 100.0
+    ) -> float:
+        r"""
+        Evaluates the continuous periodic anchor density relaxation (#16, #20):
+          H_max^cont(N) = ln(N) + ln(1 + rho_s*(gamma - 1)) - (rho_s * gamma * ln(gamma)) / (1 + rho_s*(gamma - 1))
+        For rho_s = 7/450 and gamma = 100, the constant offset is -1.88815 \approx -1.89 nats,
+        yielding 5.02, 5.43, and 5.71 nats at N = 1000, 1500, and 2000.
+        """
+        denom = 1.0 + rho_s * (gamma - 1.0)
+        offset = math.log(denom) - (rho_s * gamma * math.log(gamma)) / denom
+        return math.log(max(1.0, float(n_tokens))) + offset
+
+    @staticmethod
+    def compute_dh_dk_critical_threshold(k_tokens: float = 7.0, gamma: float = 100.0) -> float:
+        r"""
+        Computes the exact critical sequence length i_crit above which dH_max/dK < 0 (#15):
+          i_crit = ((gamma - 1)^2 / (gamma * ln(gamma) - (gamma - 1))) * K
+        At K = 7, gamma = 100, i_crit = 189.78, confirming that including <bos> (K = 8)
+        strictly tightens H_max across all i >= 190 (reducing H_max(466.7, K, 100) from 4.28 to 4.07 nats).
+        """
+        return ((gamma - 1.0) ** 2 / (gamma * math.log(gamma) - (gamma - 1.0))) * k_tokens
+
+    @staticmethod
+    def compute_retrieval_head_invariant_mass(
+        i_len: float = 466.7,
+        k_sink: float = 7.0,
+        m_inv: float = 28.0,
+        gamma_s: float = 3.2,
+        gamma_inv: float = 14.6
+    ) -> float:
+        r"""
+        Evaluates the three-group partition attention mass P_I allocated to M_inv co-located
+        invariant tokens on retrieval/induction heads (#17):
+          P_I = (M_inv * gamma_I) / (K * gamma_S + M_inv * gamma_I + (i - K - M_inv))
+        """
+        denom = k_sink * gamma_s + m_inv * gamma_inv + max(0.0, i_len - k_sink - m_inv)
+        return (m_inv * gamma_inv) / max(1e-9, denom)
+
+    def inject_anchors(
+        self,
+        prompt_text: str,
+        add_unified_diff_directive: bool = False
+    ) -> Tuple[str, List[AttentionAnchor]]:
         """
         Partitions prompt clauses into three semantic groups with structural uppercase
         landmark headers (replacing informal section headings, #36) and returns
@@ -129,6 +175,8 @@ class AttentionAnchorInjector:
             current_offset += len(inv_block) + 2
 
         # Group 2: Required Output Specification
+        if add_unified_diff_directive:
+            output_spec_clauses.append("Emit minimal unified-diff patches only.")
         if output_spec_clauses:
             anchors.append(AttentionAnchor(
                 tag=self.OUTPUT_SPEC_HEADER,

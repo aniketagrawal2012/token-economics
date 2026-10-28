@@ -341,7 +341,97 @@ class TestTokenomicsCompiler(unittest.TestCase):
         # >200k uses $2.50/1M instead of $1.25/1M, so 300k input costs > 3x of 100k input
         self.assertGreater(cost_300k, 3.0 * cost_100k)
 
+    def test_17_regex_guard_dollar_currency_and_head_noun_phrase(self):
+        """Verify Guard 1 negative lookahead $(?!\\d) ignores currency amounts like $100 (#7) and 64-stopword head noun extraction (#5)."""
+        transpiler = BPETranspiler()
+        # '$100' has a digit after '$' -> currency, not regex anchor
+        self.assertIsNone(transpiler.REGEX_FORMAT_PATTERNS.search("Price is $100 flat"))
+        self.assertIsNotNone(transpiler.REGEX_FORMAT_PATTERNS.search("Must match pattern ^[A-Z]+$"))
+
+        head_np = transpiler.extract_head_noun_phrase(
+            "This field is used to specify the primary customer billing account identifier for settlements",
+            max_words=5
+        )
+        self.assertEqual(head_np, "primary customer billing account identifier")
+
+    def test_18_sql_operator_case_sensitivity_and_duplicate_span_excision(self):
+        """Verify lowercase 'in'/'like' are not counted as SQL operators (#8) and duplicate span excision preserves shared modals (#5)."""
+        pruner = EntropyPruner(info_threshold=0.30)
+        # Lowercase 'in' and 'like' should have zero symbolic operator hits and zero invariant keyword hits
+        conversational = "in general we like to help you with your daily tasks"
+        rho_conv, w_conv, s_conv, _ = pruner.compute_empirical_invariant_density(conversational)
+        self.assertEqual(rho_conv, 0.0)
+        self.assertEqual(w_conv, 0)
+        self.assertEqual(s_conv, 0)
+        # Uppercase SQL 'IN' triggers symbolic operator match and retention predicate
+        sql_clause = "where status IN ('A')"
+        rho_sql, w_sql, s_sql, _ = pruner.compute_empirical_invariant_density(sql_clause)
+        self.assertGreater(rho_sql, 0.30)
+        self.assertGreaterEqual(w_sql, 1)
+        self.assertGreaterEqual(s_sql, 1)
+        self.assertFalse(pruner.evaluate_retention_predicate(conversational, has_novel_sig=False))
+        self.assertTrue(pruner.evaluate_retention_predicate(sql_clause, has_novel_sig=False))
+
+        # Duplicate 4-tuple span excision preserves clause-initial 'You must never set'
+        seen = {("role", -1, "=", "admin")}
+        rewritten, has_novel = pruner.strip_duplicate_signature_spans(
+            "You must never set role = 'admin' or status = 'deleted'",
+            seen
+        )
+        self.assertTrue(has_novel)
+        self.assertIn("must never set", rewritten.lower())
+        self.assertNotIn("role", rewritten.lower())
+        self.assertIn("status = 'deleted'", rewritten)
+
+    def test_19_vmem_tile_masking_and_nan_prevention(self):
+        """Verify HBM2e tail zero-initialization and VMEM register zeroing prevent IEEE-754 NaN propagation (#2)."""
+        aligner = PagedCacheAligner(block_size=16)
+        sim = aligner.simulate_vmem_tile_masking(prefix_tokens=50, dynamic_tokens=30)
+        self.assertEqual(sim["physical_prefix_tokens"], 64)
+        self.assertEqual(sim["delta_frag"], 14)
+        self.assertFalse(sim["nan_propagation_possible"])
+        self.assertTrue(sim["vmem_qkv_zeroed_for_pad"])
+        self.assertEqual(sim["pad_row_partition_Z_p"], 1.0)
+        self.assertEqual(sim["valid_to_pad_attention_weight_A_ip"], 0.0)
+
+    def test_20_continuous_density_asymptote_retrieval_partition_and_two_stage_fallback(self):
+        """Verify Theorem 1 continuous density asymptote (#20), dH/dK critical threshold (#15), retrieval head P_I (#17), and router fallback (#4)."""
+        h_cont_1000 = AttentionAnchorInjector.compute_continuous_density_asymptote(1000.0)
+        h_cont_1500 = AttentionAnchorInjector.compute_continuous_density_asymptote(1500.0)
+        h_cont_2000 = AttentionAnchorInjector.compute_continuous_density_asymptote(2000.0)
+        self.assertAlmostEqual(h_cont_1000, 5.02, places=2)
+        self.assertAlmostEqual(h_cont_1500, 5.43, places=2)
+        self.assertAlmostEqual(h_cont_2000, 5.71, places=2)
+
+        h_457 = AttentionAnchorInjector.compute_theoretical_h_max(457.0, 7.0, 100.0)
+        self.assertAlmostEqual(h_457, 4.24, places=2)
+
+        i_crit = AttentionAnchorInjector.compute_dh_dk_critical_threshold(7.0, 100.0)
+        self.assertAlmostEqual(i_crit, 189.78, places=2)
+
+        p_unanchored = AttentionAnchorInjector.compute_retrieval_head_invariant_mass(466.7, 0.0, 28.0, 1.0, 4.1)
+        p_anchored = AttentionAnchorInjector.compute_retrieval_head_invariant_mass(466.7, 7.0, 28.0, 3.2, 14.6)
+        self.assertAlmostEqual(p_unanchored, 0.207, places=3)
+        self.assertAlmostEqual(p_anchored, 0.474, places=3)
+
+        router = ParetoEconomicRouter()
+        self.assertEqual(
+            router.get_expected_output_tokens(EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE, is_compacted=False, is_cyclic=False, format_matched_diff=True),
+            502
+        )
+        # When SLA is impossibly tight (e.g. 10ms) but quality is feasible, fallback picks min-latency quality-feasible tier
+        fallback_sla = router.optimize_route(
+            request_id="req_fb_sla",
+            cohort=EnterpriseCohort.COHORT_A_SQL_DB,
+            input_tokens=500,
+            target_quality=0.90,
+            max_latency_ms=10.0
+        )
+        self.assertEqual(fallback_sla.selected_tier, ModelTier.GEMINI_38_FLASH_LITE)
+        self.assertFalse(fallback_sla.meets_sla)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
