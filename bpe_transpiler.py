@@ -151,7 +151,18 @@ class BPETranspiler:
                 if desc_words & cls.ROLE_DISAMBIGUATION_TOKENS:
                     has_sibling_role = True
 
-        if has_numeric or has_sibling_role or _has_nontrivial_format_or_deontic(has_format, has_deontic, prop_name, clean_desc):
+        # Conservative OOV structural fallback (#40): retain compact summary if description contains
+        # digits, uppercase domain acronyms (>=2 uppercase chars), or non-ASCII math/constraint symbols
+        has_oov_structural = bool(re.search(r"(?:\d|\b[A-Z]{2,}\b|[<>=\u2260\u2264\u2265])", clean_desc))
+        if has_oov_structural and prop_name and clean_desc.lower() not in f"value for {prop_name.lower()}.":
+            has_oov_guard = any(
+                tok.lower() not in prop_name.lower()
+                for tok in re.findall(r"\b[A-Z]{2,}\b|\b\d+[A-Za-z%]*\b", clean_desc)
+            )
+        else:
+            has_oov_guard = False
+
+        if has_numeric or has_sibling_role or has_oov_guard or _has_nontrivial_format_or_deontic(has_format, has_deontic, prop_name, clean_desc):
             clauses = re.split(r'[.;]', clean_desc)
             kept = [c.strip() for c in clauses if c.strip()]
             summary = kept[0] if kept else clean_desc
@@ -161,6 +172,57 @@ class BPETranspiler:
             return True, summary
 
         return False, ""
+
+    @classmethod
+    def delta_tokenize_key_boundary(cls, key_name: str, is_first_key: bool = False) -> int:
+        """
+        Evaluates subword token count across the quotation-synchronized key-delimiter transition span
+        ('{"<key>":' or ',"<key>":') anchored at '"' Viterbi lattice synchronization barriers (#6).
+        For long keys (>8 chars), uses a 4-character boundary pre-filter around '{"' / ',"' plus
+        invariant stem caching.
+        """
+        prefix_delim = '{"' if is_first_key else ',"'
+        if len(key_name) > 8:
+            boundary_window = prefix_delim + key_name[:2]
+            stem_window = key_name[2:] + '":'
+            return cls.count_tokens(boundary_window) + cls.count_tokens(stem_window)
+        full_transition = f'{prefix_delim}{key_name}":'
+        return cls.count_tokens(full_transition)
+
+    @classmethod
+    def _hoist_repeated_subtrees(cls, root_ast: Dict[str, Any], min_tokens: int = 24) -> Dict[str, Any]:
+        """
+        Implements AST Switch (ii): hoists identical post-pruning object sub-trees of >= min_tokens
+        that repeat >= 2 times into top-level '$defs' with '{"$ref":"#/$defs/..."}' pointers (#6).
+        """
+        if not isinstance(root_ast, dict) or "properties" not in root_ast or not isinstance(root_ast["properties"], dict):
+            return root_ast
+
+        props = root_ast["properties"]
+        serialized_counts: Dict[str, List[str]] = {}
+        for pk, pv in props.items():
+            if isinstance(pv, dict) and pv.get("type") == "object" and "properties" in pv:
+                s = json.dumps(pv, separators=(",", ":"), sort_keys=True)
+                if cls.count_tokens(s) >= min_tokens:
+                    serialized_counts.setdefault(s, []).append(pk)
+
+        repeated = {s: keys for s, keys in serialized_counts.items() if len(keys) >= 2}
+        if not repeated:
+            return root_ast
+
+        out_ast = dict(root_ast)
+        new_props = dict(props)
+        defs_block: Dict[str, Any] = dict(out_ast.get("$defs", {})) if isinstance(out_ast.get("$defs"), dict) else {}
+
+        for idx, (s, keys) in enumerate(repeated.items()):
+            def_name = f"T{idx}"
+            defs_block[def_name] = json.loads(s)
+            for k in keys:
+                new_props[k] = {"$ref": f"#/$defs/{def_name}"}
+
+        out_ast["properties"] = new_props
+        out_ast["$defs"] = defs_block
+        return out_ast
 
     def _transform_schema_ast(
         self,
@@ -247,12 +309,11 @@ class BPETranspiler:
 
     def canonicalize_json_schema(self, schema: Union[Dict[str, Any], str]) -> Tuple[str, int, int]:
         """
-        Searches the 2^3 = 8-candidate AST serialization space S_dense(D):
-          Bit 0: separators ((',', ':') vs. (', ', ': '))
-          Bit 1: key ordering (required-first lexicographical vs. declaration order)
-          Bit 2: union/enum folding (folded ["type", "null"] vs. expanded)
-        Synchronizes BPE evaluation at quotation-mark ('"') lattice boundaries and returns
-        (P_1^*, raw_tokens, min_compacted_tokens).
+        Searches the 2^3 = 8-candidate AST serialization space S_dense(D) (#6):
+          Switch (i): key ordering (lexicographical required-first vs. declaration order)
+          Switch (ii): inline sub-tree expansion vs. $defs/$ref type-alias hoisting (>=24 tok repeated >=2x)
+          Switch (iii): array-literal vs. compact union type declarations (["type", "null"] vs. anyOf)
+        with universal RFC 8259 minification separators=(',', ':') and exact full-sequence verification.
         """
         if isinstance(schema, str):
             try:
@@ -269,8 +330,8 @@ class BPETranspiler:
         best_str = ""
         best_tokens = float("inf")
 
-        for use_compact_sep in (True, False):
-            for order_req_first in (True, False):
+        for order_req_first in (True, False):
+            for hoist_defs in (True, False):
                 for fold_unions in (True, False):
                     cand_ast = self._transform_schema_ast(
                         schema_dict,
@@ -279,8 +340,9 @@ class BPETranspiler:
                         order_required_first=order_req_first,
                         fold_unions=fold_unions
                     )
-                    seps = (",", ":") if use_compact_sep else (", ", ": ")
-                    cand_str = json.dumps(cand_ast, separators=seps)
+                    if hoist_defs and isinstance(cand_ast, dict):
+                        cand_ast = self._hoist_repeated_subtrees(cand_ast, min_tokens=24)
+                    cand_str = json.dumps(cand_ast, separators=(",", ":"))
                     cand_tok = self.estimate_bpe_tokens(cand_str)
                     if cand_tok < best_tokens:
                         best_tokens = cand_tok

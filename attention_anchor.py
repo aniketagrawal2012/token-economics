@@ -30,6 +30,13 @@ class AttentionAnchorInjector:
     MANDATORY_INVARIANT_HEADER = "### MANDATORY EXECUTION INVARIANTS:"   # K = 7 subword tokens
     OUTPUT_SPEC_HEADER = "### REQUIRED OUTPUT SPECIFICATION:"          # K = 6 subword tokens
     TOKENS_PER_LANDMARK = 7
+    LOCAL_WINDOW_HORIZON = 450
+
+    # Informal section headings replaced by Stage 3 landmark headers (#36)
+    INFORMAL_SECTION_LABEL_PATTERN = re.compile(
+        r"^(?:rules|constraints(?:\s+and\s+notes)?|important\s+notes|guidelines|requirements)\s*:\s*$",
+        re.IGNORECASE
+    )
 
     INVARIANT_TRIGGER_PATTERNS = re.compile(
         r"\b(?:must|never|strictly|invariant|required|mandatory|prohibited|cannot|filter|where|validate|rollback|abort)\b",
@@ -44,15 +51,29 @@ class AttentionAnchorInjector:
     def __init__(self, sink_boost: float = 1.75):
         self.sink_boost = max(1.0, sink_boost)
 
+    @staticmethod
+    def compute_theoretical_h_max(i_len: float, k_tokens: float = 7.0, gamma: float = 100.0) -> float:
+        r"""
+        Evaluates Eq. (15) exact analytic upper bound on dispersive self-attention Shannon entropy (#4, #5):
+          H_max(i, K, \gamma) = ln(Z_i) - (K * \gamma * ln(\gamma)) / Z_i
+        where Z_i = K * \gamma + (i - K) for i > K > 0 and \gamma > 1.
+        At i = W_loc = 450, K = 7, \gamma = 100: Z_450 = 1143, H_max = 4.2229 nats (\approx 4.22 nats;
+        4.25 nats at effective window i = W_loc + K = 457).
+        """
+        if i_len <= k_tokens or gamma <= 1.0:
+            return math.log(max(1.0, float(i_len)))
+        z_i = float(k_tokens) * float(gamma) + (float(i_len) - float(k_tokens))
+        return math.log(z_i) - (float(k_tokens) * float(gamma) * math.log(float(gamma))) / z_i
+
     def inject_anchors(self, prompt_text: str) -> Tuple[str, List[AttentionAnchor]]:
         """
         Partitions prompt clauses into three semantic groups with structural uppercase
-        landmark headers and returns (anchored_prompt, injected_anchors).
+        landmark headers (replacing informal section headings, #36) and returns
+        (anchored_prompt, injected_anchors).
         """
         if not prompt_text:
             return "", []
 
-        # Separate any pre-tagged schema or payload sections from the instruction body
         sections = prompt_text.split("\n\n")
         instruction_lines: List[str] = []
         trailing_sections: List[str] = []
@@ -69,6 +90,9 @@ class AttentionAnchorInjector:
         general_clauses: List[str] = []
 
         for line in instruction_lines:
+            # Strip informal section labels replaced by Stage 3 headers (#36)
+            if self.INFORMAL_SECTION_LABEL_PATTERN.match(line):
+                continue
             if line.startswith("### "):
                 general_clauses.append(line)
                 continue
@@ -127,29 +151,28 @@ class AttentionAnchorInjector:
     def calculate_attention_entropy(
         self,
         num_tokens: int,
-        anchors: List[AttentionAnchor]
+        anchors: List[AttentionAnchor],
+        periodic_landmarks: bool = False
     ) -> AttentionMetrics:
         r"""
         Evaluates Theorem 1 closed-form upper bound on causal self-attention Shannon entropy:
           H_raw(i)             = ln(i)
           H_max(i, K, \gamma)  = ln(K * \gamma + i - K) - (K * \gamma * ln(\gamma)) / (K * \gamma + i - K)
-        where K is the active anchor token count (7 tokens per injected landmark header, capped < i)
-        and \gamma = \bar{w}_A / \bar{w}_U is the group-mean unnormalized attention weight ratio.
+        where K is the active antecedent anchor token count (S_i = S \subset {1, ..., i-1} for
+        i > |P_prefix| + \Delta_frag + K, #8; with optional periodic injection K(i) = 7 * ceil(i / 450)
+        when relative distance exceeds W_loc = 450, #5).
         """
         i_len = max(16, num_tokens)
-        k_tokens = min(i_len // 2, max(self.TOKENS_PER_LANDMARK, len(anchors) * self.TOKENS_PER_LANDMARK))
+        base_k = max(self.TOKENS_PER_LANDMARK, len(anchors) * self.TOKENS_PER_LANDMARK)
+        if periodic_landmarks and i_len > self.LOCAL_WINDOW_HORIZON:
+            base_k = max(base_k, self.TOKENS_PER_LANDMARK * int(math.ceil(i_len / float(self.LOCAL_WINDOW_HORIZON))))
+        k_tokens = min(i_len // 2, base_k)
         gamma = self.sink_boost
 
-        # Maximum diffuse entropy (uniform distribution over i_len tokens)
         h_raw = math.log(float(i_len))
-
-        # Theorem 1 exact upper bound H_max(i, K, gamma)
         denom = float(k_tokens) * gamma + float(i_len - k_tokens)
-        h_max = math.log(denom) - (float(k_tokens) * gamma * math.log(gamma)) / denom
+        h_max = self.compute_theoretical_h_max(float(i_len), float(k_tokens), gamma)
 
-        # Observed intra-group non-uniformity further lowers empirical anchored entropy below H_max
-        # (Whereas H_max assumes piecewise-uniform probabilities within A and U, real attention concentrates
-        # on key tokens inside A and U, yielding ~12-18% lower empirical entropy than H_max)
         intra_group_concentration_factor = 0.86
         h_anchored = min(h_max, h_max * intra_group_concentration_factor)
 
@@ -163,3 +186,4 @@ class AttentionAnchorInjector:
             attention_sink_density=round(sink_density, 4),
             dispersion_bounded=bool(h_anchored <= h_max + 1e-9 and h_max < h_raw)
         )
+

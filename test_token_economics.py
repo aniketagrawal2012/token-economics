@@ -275,6 +275,73 @@ class TestTokenomicsCompiler(unittest.TestCase):
         self.assertGreater(decision.net_cost_savings_pct, 30.0)
         self.assertGreaterEqual(decision.expected_quality_score, 0.90)
 
+    def test_13_eq7_disjunct_non_redundancy_and_coordinated_negation(self):
+        """Verify Eq. (7) Disjunct 2 (|T_M| <= 2) vs Disjunct 3 and coordinated negation propagation (#1, #3)."""
+        pruner = EntropyPruner(info_threshold=0.30, custom_lexicon={"custom_slas"})
+        # Single symbolic operator of length <= 2 passes Disjunct 2
+        self.assertTrue(pruner.evaluate_retention_predicate("=1", has_novel_sig=False))
+        # Coordinated negation propagates pi = -1 across both conjuncts (#3)
+        coord_clause = "Do not under any circumstances set status = 'active' or role = 'admin'"
+        sigs = pruner.extract_polarity_signature(coord_clause)
+        self.assertIn(("status", -1, "=", "active"), sigs)
+        self.assertIn(("role", -1, "=", "admin"), sigs)
+
+    def test_14_theorem_1_exact_entropy_bounds(self):
+        """Verify Eq. (15) exact H_max values at W_loc=450 (4.22 nats), N=466.7 (4.28 nats), and N=1000 (5.53 nats) (#4, #5)."""
+        h_450 = AttentionAnchorInjector.compute_theoretical_h_max(450.0, 7.0, 100.0)
+        h_466 = AttentionAnchorInjector.compute_theoretical_h_max(466.7, 7.0, 100.0)
+        h_1000 = AttentionAnchorInjector.compute_theoretical_h_max(1000.0, 7.0, 100.0)
+        h_2000 = AttentionAnchorInjector.compute_theoretical_h_max(2000.0, 7.0, 100.0)
+        self.assertAlmostEqual(h_450, 4.22, places=2)
+        self.assertAlmostEqual(h_466, 4.28, places=2)
+        self.assertAlmostEqual(h_1000, 5.53, places=2)
+        self.assertAlmostEqual(h_2000, 6.70, places=2)
+
+    def test_15_ast_defs_hoisting_and_key_boundary_delta_tokenization(self):
+        """Verify Stage 1 $defs/$ref sub-tree hoisting and key-boundary delta tokenization (#6)."""
+        transpiler = BPETranspiler()
+        repeated_sub = {
+            "type": "object",
+            "properties": {
+                "street_address_line_1": {"type": "string"},
+                "street_address_line_2": {"type": "string"},
+                "postal_zip_code": {"type": "string"},
+                "iso_country_code": {"type": "string"},
+                "municipality_city": {"type": "string"},
+                "state_province_region": {"type": "string"},
+            },
+            "required": ["street_address_line_1", "postal_zip_code", "iso_country_code"]
+        }
+        schema_with_dups = {
+            "type": "object",
+            "properties": {
+                "billing_address": repeated_sub,
+                "shipping_address": repeated_sub,
+                "warehouse_address": repeated_sub,
+            }
+        }
+        canonical_str, raw_tok, comp_tok = transpiler.canonicalize_json_schema(schema_with_dups)
+        self.assertLess(comp_tok, raw_tok)
+        self.assertIn("$defs", canonical_str)
+        self.assertIn("$ref", canonical_str)
+        self.assertGreater(transpiler.delta_tokenize_key_boundary("billing_address", is_first_key=True), 0)
+
+    def test_16_router_classifier_precedence_and_200k_step_pricing(self):
+        """Verify AST classifier priority rules, sandbox constants, and 200k tiered pricing step function (#13, #14, #20)."""
+        router = ParetoEconomicRouter()
+        self.assertEqual(router.COHORT_SANDBOX_LATENCY_MS[EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE], 482.0)
+        cohort_e, delta_e = router.classify_workload_and_cyclicity(
+            "HTTP 412 Precondition Failed due to ETag conflict; retry_count >= 3; SELECT * FROM orders"
+        )
+        self.assertEqual(cohort_e, EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING)
+        self.assertEqual(delta_e, 0.030)
+
+        cost_100k = router.calculate_invocation_cost(ModelTier.GEMINI_25_PRO, 100_000, 100)
+        cost_300k = router.calculate_invocation_cost(ModelTier.GEMINI_25_PRO, 300_000, 100)
+        # >200k uses $2.50/1M instead of $1.25/1M, so 300k input costs > 3x of 100k input
+        self.assertGreater(cost_300k, 3.0 * cost_100k)
+
 
 if __name__ == "__main__":
     unittest.main()
+

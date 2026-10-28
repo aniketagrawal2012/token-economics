@@ -90,6 +90,24 @@ class ParetoEconomicRouter:
         }
     }
 
+    # Calibrated per-cohort sandbox verification overhead L_hat_sandbox in ms (#13, #22)
+    COHORT_SANDBOX_LATENCY_MS: Dict[EnterpriseCohort, float] = {
+        EnterpriseCohort.COHORT_A_SQL_DB: 714.2,
+        EnterpriseCohort.COHORT_B_AGENT_OPENAPI: 655.0,
+        EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE: 641.0,
+        EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE: 482.0,
+        EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING: 662.0,
+    }
+
+    # Calibrated per-cohort end-to-end SLA latency ceilings L_max in ms (#13, #22)
+    COHORT_SLA_LIMIT_MS: Dict[EnterpriseCohort, float] = {
+        EnterpriseCohort.COHORT_A_SQL_DB: 2000.0,
+        EnterpriseCohort.COHORT_B_AGENT_OPENAPI: 2000.0,
+        EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE: 2000.0,
+        EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE: 2500.0,
+        EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING: 2000.0,
+    }
+
     @classmethod
     def detect_schema_or_import_cycles(
         cls,
@@ -98,16 +116,50 @@ class ParetoEconomicRouter:
     ) -> bool:
         """
         Inspects JSON/OpenAPI schemas for recursive '$ref' or self-referential object structures,
-        and inspects source code / transaction logs for cyclic references or retry loops.
+        and inspects source code / transaction logs for cyclic references or retry loops (#14).
         """
         if schema:
-            schema_str = str(schema)
+            schema_str = json.dumps(schema, sort_keys=True) if isinstance(schema, dict) else str(schema)
             if "$ref" in schema_str or "additionalProperties" in schema_str:
                 return True
         if context_payload:
-            if re.search(r"\b(?:rollback|retry|INTERLEAVE\s+IN\s+PARENT|structuring|single\s+business\s+day)\b", context_payload, re.I):
+            if re.search(
+                r"\b(?:rollback|retry(?:_count)?|INTERLEAVE\s+IN\s+PARENT|structuring|single\s+business\s+day|"
+                r"import\s+[a-z0-9_./\"']+.*import\s+[a-z0-9_./\"']+)\b",
+                context_payload,
+                re.I | re.S
+            ):
                 return True
         return False
+
+    @classmethod
+    def classify_workload_and_cyclicity(
+        cls,
+        instruction: str,
+        schema: Optional[Dict[str, Any]] = None,
+        context_payload: Optional[str] = None
+    ) -> Tuple[EnterpriseCohort, float]:
+        """
+        Deterministic rule-based AST workload classifier (#14) with strict precedence order:
+          Cohort E (Multi-Turn Retry/ETag) > Cohort D (Code Refactoring) >
+          Cohort C (Financial SOX/AML) > Cohort B (OpenAPI Tool Dispatch) > Cohort A (SQL DB).
+        Returns (assigned_cohort, delta_inst) in < 0.15 ms where delta_inst in {0.0, 0.030}.
+        """
+        combined = f"{instruction or ''}\n{context_payload or ''}\n{json.dumps(schema) if isinstance(schema, dict) else (schema or '')}"
+        delta_inst = 0.030 if cls.detect_schema_or_import_cycles(schema, combined) else 0.0
+
+        if re.search(r"\b(?:HTTP\s+412|ETag|retry_count|circuit\s+breaker|Precondition\s+Failed)\b", combined, re.I):
+            return EnterpriseCohort.COHORT_E_MULTI_TURN_REASONING, delta_inst
+        if re.search(r"\b(?:Java\s+Enterprise\s+Bean|JTA|refactor.*Go|go_code|unit_tests|package\s+[a-z0-9_]+)\b", combined, re.I):
+            return EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE, delta_inst
+        if re.search(r"\b(?:SOX|AML|FinCEN|sender_bic|receiver_iban|AML_SURVEILLANCE_TRIGGER)\b", combined, re.I):
+            return EnterpriseCohort.COHORT_C_FINANCIAL_COMPLIANCE, delta_inst
+        if re.search(r"\b(?:OpenAPI|idempotency_key|operationId|paths|charge_credit_card|dispatch_warehouse_freight)\b", combined, re.I):
+            return EnterpriseCohort.COHORT_B_AGENT_OPENAPI, delta_inst
+        if re.search(r"\b(?:SELECT|FROM|WHERE|Spanner|sql_statement|ORDER\s+BY)\b", combined, re.I):
+            return EnterpriseCohort.COHORT_A_SQL_DB, delta_inst
+
+        return EnterpriseCohort.COHORT_D_LONG_CONTEXT_CODE, delta_inst
 
     @classmethod
     def compute_task_complexity(
@@ -135,7 +187,7 @@ class ParetoEconomicRouter:
         c_task: float = 1.0
     ) -> Tuple[int, float]:
         r"""
-        Evaluates Eq. (16) and Eq. (17):
+        Evaluates Eq. (24) and Eq. (25):
           Q(P, M, T_think) = min(1.0, Q_base(M, c) + Delta_Q_max(M) * C_task(P) * ln(1 + T_think) / ln(1 + T_max))
           T_think^*(M)     = ceil(max(0, (1 + T_max)^{Omega(M)} - 1))
         where Omega(M) = max(0, Q^* - Q_base(M, c)) / (Delta_Q_max(M) * C_task(P)).
@@ -151,7 +203,6 @@ class ParetoEconomicRouter:
 
         omega = (target_quality - q_base) / effective_span
         if omega > 1.0:
-            # Even T_max thinking tokens cannot reach target_quality on this tier
             t_think = self.T_MAX_THINKING
             achieved_q = min(1.0, q_base + effective_span)
             return t_think, round(achieved_q, 4)
@@ -176,18 +227,25 @@ class ParetoEconomicRouter:
         prefix_tokens: int = 0
     ) -> float:
         """
-        Evaluates Eq. (13) exact per-request dollar cost C_total(P, M, T_think).
+        Evaluates Eq. (21) exact per-request dollar cost Cost(M, L_in, L_prefix, L_out, T_think, h),
+        incorporating the 200k-token step function on P_in(M, L_in) for Argon/Pro (#20).
         """
         pricing = PricingSpec.get_tier_pricing(tier)
+        eff_in_price = pricing.input_per_million
+        eff_cache_price = pricing.cached_input_per_million
+        if tier == ModelTier.GEMINI_25_PRO and input_tokens > 200_000:
+            eff_in_price = 2.50
+            eff_cache_price = 0.625
+
         if is_cached and prefix_tokens > 0:
             cached_tok = min(input_tokens, prefix_tokens)
             uncached_tok = max(0, input_tokens - cached_tok)
             input_cost = (
-                (cached_tok / 1_000_000.0) * pricing.cached_input_per_million
-                + (uncached_tok / 1_000_000.0) * pricing.input_per_million
+                (cached_tok / 1_000_000.0) * eff_cache_price
+                + (uncached_tok / 1_000_000.0) * eff_in_price
             )
         else:
-            input_cost = (input_tokens / 1_000_000.0) * pricing.input_per_million
+            input_cost = (input_tokens / 1_000_000.0) * eff_in_price
 
         output_cost = (output_tokens / 1_000_000.0) * pricing.output_per_million
         thinking_cost = (thinking_tokens / 1_000_000.0) * pricing.thinking_per_million
